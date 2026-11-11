@@ -1,7 +1,13 @@
 pandas
+numpy
 openpyxl
 missingno
 matplotlib
 seaborn
 scikit-learn
-xgboost
+xgboost
+joblib
+holidays
+fastapi
+uvicorn
+pydantic

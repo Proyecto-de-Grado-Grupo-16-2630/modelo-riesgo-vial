@@ -1,10 +1,20 @@
 import os
+import re
 import json
 import joblib
 import pandas as pd
+from typing import Optional
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+
+# Importación segura del geocodificador gratuito (Nominatim / OpenStreetMap)
+try:
+    from geopy.geocoders import Nominatim
+    from geopy.exc import GeocoderTimedOut, GeocoderServiceError
+    GEOPY_DISPONIBLE = True
+except ImportError:
+    GEOPY_DISPONIBLE = False
 
 # --- 1. CONFIGURACIÓN DE RUTAS Y ARTEFACTOS ---
 CARPETA_GEO     = "../../outputs/geo_evaluacion/"
@@ -32,11 +42,14 @@ if os.path.exists(RUTA_PLANTILLA):
     ORDEN_49 = config_imputacion.get('orden_columnas_49', [])
     VALORES_DEFECTO = config_imputacion.get('valores_defecto', {})
 
+# Inicializar cliente de geocodificación Nominatim
+geocoder = Nominatim(user_agent="proyecto_grado_riesgo_vial_bogota_2026", timeout=5) if GEOPY_DISPONIBLE else None
+
 # --- 3. INICIALIZACIÓN DE FASTAPI ---
 app = FastAPI(
     title="API de Predicción de Riesgo Vial - Bogotá",
-    description="Microservicio Python para inferencia del modelo Lite (Estrategia A predeterminada)",
-    version="1.1.0"
+    description="Microservicio Python para inferencia ML (Estrategia A/B) y geocodificación espacial",
+    version="1.2.0"
 )
 
 # Habilitar CORS para permitir peticiones desde Angular / Spring Boot u otras máquinas/puertos
@@ -48,7 +61,93 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- 4. ESQUEMA DE DATOS ENVIADOS DESDE LA WEB ---
+# --- 4. FUNCIÓN AUXILIAR DE GEOCODIFICACIÓN (BOGOTÁ) ---
+def normalizar_direccion_bogota(direccion: str) -> str:
+    """Expande abreviaturas viales de Bogotá y asegura el contexto geográfico."""
+    texto = direccion.strip()
+    reemplazos = [
+        (r'\b(ak|av\.?\s*kr|av\.?\s*cra)\b', 'Avenida Carrera'),
+        (r'\b(ac|av\.?\s*cl|av\.?\s*cll)\b', 'Avenida Calle'),
+        (r'\b(kr|cra|k)\b', 'Carrera'),
+        (r'\b(cl|cll|c)\b', 'Calle'),
+        (r'\b(dg|diag)\b', 'Diagonal'),
+        (r'\b(tv|transv)\b', 'Transversal'),
+        (r'\b(av)\b', 'Avenida'),
+    ]
+    for patron, reemplazo in reemplazos:
+        texto = re.sub(patron, reemplazo, texto, flags=re.IGNORECASE)
+
+    if "bogota" not in texto.lower() and "bogotá" not in texto.lower():
+        texto = f"{texto}, Bogotá, Colombia"
+    elif "colombia" not in texto.lower():
+        texto = f"{texto}, Colombia"
+
+    return texto
+
+
+def geocodificar_evento(direccion: Optional[str]) -> dict:
+    """Convierte una dirección en coordenadas (latitud, longitud) sin afectar el modelo ML."""
+    if not direccion or not direccion.strip():
+        return {
+            "estado": "NO_SOLICITADA",
+            "direccion_ingresada": None,
+            "direccion_normalizada": None,
+            "latitud": None,
+            "longitud": None
+        }
+
+    if not GEOPY_DISPONIBLE or geocoder is None:
+        return {
+            "estado": "DEPENDENCIA_FALTANTE",
+            "direccion_ingresada": direccion,
+            "direccion_normalizada": None,
+            "latitud": None,
+            "longitud": None,
+            "detalle": "Instale geopy en el entorno Python ejecutando: pip install geopy"
+        }
+
+    direccion_norm = normalizar_direccion_bogota(direccion)
+
+    try:
+        # Acotar búsqueda a Colombia y al área metropolitana de Bogotá
+        ubicacion = geocoder.geocode(
+            direccion_norm,
+            country_codes="co",
+            viewbox=[(4.83, -74.23), (4.46, -73.99)],
+            bounded=True
+        )
+
+        if ubicacion:
+            return {
+                "estado": "ENCONTRADA",
+                "direccion_ingresada": direccion,
+                "direccion_normalizada": direccion_norm,
+                "direccion_oficial": ubicacion.address,
+                "latitud": round(float(ubicacion.latitude), 6),
+                "longitud": round(float(ubicacion.longitude), 6)
+            }
+        else:
+            return {
+                "estado": "NO_ENCONTRADA",
+                "direccion_ingresada": direccion,
+                "direccion_normalizada": direccion_norm,
+                "latitud": None,
+                "longitud": None,
+                "detalle": "No se encontraron coordenadas exactas en Bogotá para la dirección ingresada."
+            }
+
+    except (GeocoderTimedOut, GeocoderServiceError) as e:
+        return {
+            "estado": "ERROR_SERVICIO",
+            "direccion_ingresada": direccion,
+            "direccion_normalizada": direccion_norm,
+            "latitud": None,
+            "longitud": None,
+            "detalle": f"El servicio de geocodificación no respondió a tiempo: {str(e)}"
+        }
+
+
+# --- 5. ESQUEMA DE DATOS ENVIADOS DESDE LA WEB ---
 class SolicitudPrediccion(BaseModel):
     total_actores: int = Field(..., example=3, description="Número de personas involucradas")
     total_vehiculos: int = Field(..., example=2, description="Número de vehículos involucrados")
@@ -59,12 +158,13 @@ class SolicitudPrediccion(BaseModel):
     clase_camion_furgon: int = Field(0, example=0, description="1 si participó camión o furgón, 0 si no")
     clase_campero: int = Field(0, example=0, description="1 si participó campero, 0 si no")
     estrategia: str = Field("A", example="A", description="Estrategia a usar: 'A' (Lite 8 vars - Predeterminada) o 'B' (Imputación 49 vars)")
+    direccion: Optional[str] = Field(None, example="Calle 26 # 68-75, Bogotá", description="Campo localizador opcional para ubicar el evento en el mapa (no entra al modelo)")
 
 
-# --- 5. ENDPOINT DE PREDICCIÓN ---
+# --- 6. ENDPOINT DE PREDICCIÓN Y GEORREFERENCIACIÓN ---
 @app.post("/api/v1/predecir-riesgo")
 def predecir_riesgo(datos: SolicitudPrediccion):
-    # Map con los 8 atributos recibidos del frontend
+    # Map estricto con los 8 atributos predictivos del modelo
     input_top8 = {
         "CHOQUE_DESC_sin choque registrado": datos.choque_sin_registro,
         "CHOQUE_DESC_vehiculo": datos.choque_vehiculo,
@@ -116,6 +216,9 @@ def predecir_riesgo(datos: SolicitudPrediccion):
     else:
         nivel_riesgo = "BAJO"
 
+    # Ejecutar geocodificación independiente del 9.º campo localizador
+    resultado_ubicacion = geocodificar_evento(datos.direccion)
+
     return {
         "estrategia_aplicada": estrategia_elegida,
         "prediccion_codigo": clase_predicha,
@@ -125,5 +228,6 @@ def predecir_riesgo(datos: SolicitudPrediccion):
             "con_heridos": round(prob_heridos, 4),
             "con_muertos": round(prob_fatal, 4)
         },
-        "nivel_riesgo": nivel_riesgo
+        "nivel_riesgo": nivel_riesgo,
+        "ubicacion": resultado_ubicacion
     }
